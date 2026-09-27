@@ -198,6 +198,12 @@ def _no_init_weights():
     return no_init_weights()
 
 
+def _dtype_kwarg():
+    """transformers 5 renamed `torch_dtype` to `dtype` (the old name still works, with a warning)."""
+    from transformers import __version__
+    return 'dtype' if int(__version__.split('.')[0]) >= 5 else 'torch_dtype'
+
+
 def _checkpoint_key_renamer(model):
     """
     Returns a function that maps a tensor name as stored in a DFloat11 checkpoint to the
@@ -268,6 +274,15 @@ class DFloat11ExpertUnit(nn.Module):
         self.parts = parts
 
 
+def _supported_expert_ops():
+    """The conversion operations the fused-expert path supports: stacking experts and
+    concatenating weights (for example gate and up). With these, a weight's 2D shape
+    determines where each of its values goes, so `_source_shapes` cannot pick a shape
+    that fits but places values wrongly."""
+    from transformers.core_model_loading import Concatenate, MergeModulelist
+    return (MergeModulelist, Concatenate)
+
+
 def _fused_expert_plan(rename, unit, attr_names):
     """
     For a DFloat11 unit that holds one MoE expert (`...experts.N` with its weights), finds
@@ -284,6 +299,8 @@ def _fused_expert_plan(rename, unit, attr_names):
         if match is None:
             return None
         converter, (target_key, source_pattern) = match
+        if not all(isinstance(op, _supported_expert_ops()) for op in converter.operations):
+            return None
         path, param_name = target_key.rsplit('.', 1)
         rest = key[len(path) + 1:].split('.') if key.startswith(path + '.') else []
         if not rest or not rest[0].isdigit() or experts_path not in (None, path):
@@ -309,7 +326,7 @@ def _source_shapes(module, unit, sizes):
                 for op in converter.operations:
                     tensors = op.convert(tensors, source_patterns=converter.source_patterns,
                                          target_patterns=converter.target_patterns)
-            except Exception:
+            except RuntimeError:  # the shapes cannot be concatenated
                 continue
             out = next(iter(tensors.values()))
             if tuple(out.shape) == target_shape:
@@ -357,7 +374,7 @@ def get_experts_hook(threads_per_block, bytes_per_thread):
 
     def experts_hook(module, args, kwargs):
         top_k_index = kwargs['top_k_index'] if 'top_k_index' in kwargs else args[1]
-        device = top_k_index.device
+        device = next(iter(module.df11_experts.values())).luts.device
         fused = {name: FusedExpertBuffers.get(device, name, shape)
                  for name, shape in module._df11_fused_shapes.items()}
         for index in torch.unique(top_k_index).tolist():
@@ -468,6 +485,16 @@ def load_and_replace_tensors(
                     )
                 elif new_weight_key.endswith(inside):
                     new_unit = new_weight_key[: -len(inside)]
+                    for attr in attr_names[1:]:
+                        other_key = f"{unit}.{attr}.weight"
+                        new_other_key, other_needs_conversion = rename(other_key)
+                        if other_needs_conversion or new_other_key != f"{new_unit}.{attr}.weight":
+                            problems.append(
+                                f"{unit} (DFloat11 unit): its weight {other_key} becomes {new_other_key}, "
+                                f"not {new_unit}.{attr}.weight; renaming inside a unit is not supported"
+                            )
+                            new_unit = None
+                            break
                 else:
                     new_unit = None
                     problems.append(f"{unit} (DFloat11 unit): its weight {weight_key} is renamed to {new_weight_key}, which changes a name inside the unit; not supported")
@@ -668,7 +695,8 @@ class DFloat11Model:
             max_memory: Maximum memory allocation per device
             bfloat16_model: Optional pre-initialized model to load weights into
             cpu_offload: Enables CPU offloading; only keeps a single block of weights in GPU at once
-            cpu_offload_blocks: Number of transformer blocks to offload to CPU; if None, offload all blocks
+            cpu_offload_blocks: Number of DFloat11 units (usually transformer blocks; single experts for
+                MoE models on transformers 5) to offload to CPU; if None, offload all of them
             pin_memory: Enables memory-pinning/page-locking when using CPU offloading
             from_single_file: Whether to load a single safetensors file
             pattern_dict: Dictionary mapping regex patterns to submodule lists
@@ -716,7 +744,7 @@ class DFloat11Model:
             config = AutoConfig.from_pretrained(dfloat11_model_path)
             with _no_init_weights():
                 model = AutoModelForCausalLM.from_config(
-                    config, torch_dtype=torch.bfloat16, **kwargs,
+                    config, **{_dtype_kwarg(): torch.bfloat16}, **kwargs,
                 )
                 model.tie_weights()
                 model.eval()
@@ -804,15 +832,16 @@ def compress_model(
     save_single_file: bool = True,
     check_correctness: bool = True,
 ):
-    os.makedirs(save_path, exist_ok=True)
-
     module_names = [full_name for full_name, _ in model.named_modules()]
     unmatched = [pattern for pattern in pattern_dict if not any(re.fullmatch(pattern, n) for n in module_names)]
     if unmatched:
         raise ValueError(
             f"pattern(s) {unmatched} match no module of {type(model).__name__}; nothing would be "
-            f"compressed for them. (With transformers 5, MoE experts are one fused module per layer.)"
+            f"compressed for them. (With transformers 5, MoE experts are one fused module per layer; "
+            f"compress MoE models with transformers<5, the result loads with either.)"
         )
+
+    os.makedirs(save_path, exist_ok=True)
 
     block_index = 0
     save_model = True

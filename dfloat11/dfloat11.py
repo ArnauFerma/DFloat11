@@ -16,7 +16,7 @@ import math
 import os
 import re
 import json
-import pkg_resources
+from importlib.resources import files
 from sys import stderr
 from typing import Optional, Dict, Union
 from tqdm import tqdm
@@ -36,7 +36,7 @@ from .dfloat11_utils import get_codec, get_32bit_codec, get_luts, encode_weights
 
 
 # Load CUDA kernel for custom DFloat11 tensor decoding
-ptx_path = pkg_resources.resource_filename("dfloat11", "decode.ptx")
+ptx_path = str(files("dfloat11") / "decode.ptx")
 _decode = cp.RawModule(path=ptx_path).get_function('decode')
 
 
@@ -176,6 +176,63 @@ def get_hook(threads_per_block, bytes_per_thread):
     return decode_hook
 
 
+def _no_init_weights():
+    """transformers' `no_init_weights` context manager, which moved from
+    `transformers.modeling_utils` to `transformers.initialization` in transformers 5."""
+    try:
+        from transformers.initialization import no_init_weights
+    except ImportError:
+        from transformers.modeling_utils import no_init_weights
+    return no_init_weights()
+
+
+def _checkpoint_key_renamer(model):
+    """
+    Returns a function that maps a tensor name as stored in a DFloat11 checkpoint to the
+    name of the same tensor in `model`, and whether that tensor would need a weight
+    conversion that is not a renaming.
+
+    DFloat11 checkpoints keep the names of the transformers version they were compressed
+    with. Newer transformers versions rename some modules when they load a checkpoint:
+    since 4.52, vision-language models such as Gemma 3 and Qwen2.5-VL move
+    `language_model.model.*` to `model.language_model.*`, and transformers 5 describes
+    these renamings, and other conversions such as fused MoE experts, in its conversion
+    mapping. This applies the same renamings as transformers' own loader.
+    """
+    try:
+        from transformers import PreTrainedModel
+    except ImportError:
+        PreTrainedModel = None
+    if PreTrainedModel is None or not isinstance(model, PreTrainedModel):
+        return lambda key: (key, False)
+
+    try:  # transformers >= 5
+        from transformers.conversion_mapping import get_model_conversion_mapping
+        from transformers.core_model_loading import WeightConverter, rename_source_key
+    except ImportError:  # transformers 4: a class attribute of regex renamings, first match wins
+        key_mapping = getattr(model, '_checkpoint_conversion_mapping', None) or {}
+
+        def rename(key):
+            for pattern, replacement in key_mapping.items():
+                new_key, n_replaced = re.subn(pattern, replacement, key)
+                if n_replaced > 0:
+                    return new_key, False
+            return key, False
+        return rename
+
+    transforms = get_model_conversion_mapping(model)
+    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+    expected_keys = dict.fromkeys(model.state_dict(), True)
+
+    def rename(key):
+        new_key, converter_pattern = rename_source_key(
+            key, renamings, converters, model.base_model_prefix, expected_keys
+        )
+        return new_key, converter_pattern is not None
+    return rename
+
+
 def load_and_replace_tensors(
     model,
     directory_path,
@@ -193,9 +250,16 @@ def load_and_replace_tensors(
         model: The PyTorch model to load weights into
         directory_path: Path to the directory containing safetensors files
         dfloat11_config: Configuration for DFloat11 compression
-        
+
+    Tensor names are translated with the renamings the installed transformers applies to
+    checkpoints (see `_checkpoint_key_renamer`).
+
     Returns:
         The model with configured DFloat11 compression
+
+    Raises:
+        ValueError: if any tensor of the checkpoint cannot be placed in the model, which
+            would otherwise leave uninitialized weights.
     """
     threads_per_block = dfloat11_config['threads_per_block']
     bytes_per_thread  = dfloat11_config['bytes_per_thread']
@@ -212,6 +276,54 @@ def load_and_replace_tensors(
             loading_desc += ', memory pinned'
         loading_desc += ')'
 
+    rename = _checkpoint_key_renamer(model)
+    try:
+        from transformers import __version__ as transformers_version
+    except ImportError:
+        transformers_version = 'none'
+    df11_suffixes = ('luts', 'encoded_exponent', 'sign_mantissa', 'output_positions', 'gaps', 'split_positions')
+    unit_names = {}  # DFloat11 unit name in the checkpoint -> its name in the model
+    problems = []
+
+    def rename_tensor(tensor_name):
+        """The tensor's name in the model. The name of a DFloat11 buffer is its unit's
+        name plus the buffer name; the unit is renamed through the name of one weight it
+        holds, since the renamings are written for weight names."""
+        unit, _, suffix = tensor_name.rpartition('.')
+        if suffix not in df11_suffixes:
+            new_name, needs_conversion = rename(tensor_name)
+        else:
+            if unit not in unit_names:
+                attr_names = next(
+                    (attrs for pattern, attrs in pattern_dict.items() if re.fullmatch(pattern, unit)), []
+                )
+                weight_key = f"{unit}.{attr_names[0]}.weight" if attr_names else f"{unit}.weight"
+                new_weight_key, needs_conversion = rename(weight_key)
+                inside = weight_key[len(unit):]  # the weight's name inside the unit
+                if needs_conversion:
+                    new_unit = None
+                    problems.append(
+                        f"{unit} (DFloat11 unit): transformers {transformers_version} converts this module's "
+                        f"weights into another layout (for example MoE experts fused into one tensor), which "
+                        f"DFloat11 does not support yet; transformers<5 loads it"
+                    )
+                elif new_weight_key.endswith(inside):
+                    new_unit = new_weight_key[: -len(inside)]
+                else:
+                    new_unit = None
+                    problems.append(f"{unit} (DFloat11 unit): its weight {weight_key} is renamed to {new_weight_key}, which changes a name inside the unit; not supported")
+                unit_names[unit] = (new_unit, needs_conversion)
+            new_unit, needs_conversion = unit_names[unit]
+            new_name = f"{new_unit}.{suffix}" if new_unit is not None else None
+        if needs_conversion:
+            if suffix not in df11_suffixes:
+                problems.append(
+                    f"{tensor_name}: transformers {transformers_version} converts this weight into another "
+                    f"layout, which DFloat11 does not support yet"
+                )
+            return None
+        return new_name
+
     for file_name in tqdm(safetensors_files, desc=loading_desc):
         file_path = os.path.join(directory_path, file_name) if not from_single_file else file_name
         
@@ -219,7 +331,10 @@ def load_and_replace_tensors(
         loaded_tensors = load_file(file_path)
         
         # Iterate over each tensor in the file
-        for tensor_name, tensor_value in loaded_tensors.items():
+        for checkpoint_name, tensor_value in loaded_tensors.items():
+            tensor_name = rename_tensor(checkpoint_name)
+            if tensor_name is None:
+                continue
             # Check if this tensor exists in the model's state dict
             if tensor_name in model.state_dict():
                 # Get the parameter or buffer
@@ -229,14 +344,14 @@ def load_and_replace_tensors(
                     if param.shape == tensor_value.shape:
                         param.data.copy_(tensor_value)
                     else:
-                        print(f"Shape mismatch for {tensor_name}: model {param.shape} vs loaded {tensor_value.shape}", file=stderr)
+                        problems.append(f"{checkpoint_name}: shape {tuple(tensor_value.shape)} in the checkpoint, {tuple(param.shape)} in the model")
                 else:
                     # It's a buffer, we can also set it directly
                     buffer = dict(model.named_buffers())[tensor_name]
                     if buffer.shape == tensor_value.shape:
                         buffer.copy_(tensor_value)
                     else:
-                        print(f"Shape mismatch for {tensor_name}: model {buffer.shape} vs loaded {tensor_value.shape}", file=stderr)
+                        problems.append(f"{checkpoint_name}: shape {tuple(tensor_value.shape)} in the checkpoint, {tuple(buffer.shape)} in the model")
             else:
                 # Split the tensor name to get module path
                 parts = tensor_name.split('.')
@@ -247,7 +362,7 @@ def load_and_replace_tensors(
                     if hasattr(module, part):
                         module = getattr(module, part)
                     else:
-                        print(f"Cannot find module path for {tensor_name}", file=stderr)
+                        problems.append(f"{checkpoint_name}: no module '{'.'.join(parts[:i + 1])}' in the model")
                         break
                 else:
                     if parts[-1] == 'split_positions':
@@ -271,8 +386,9 @@ def load_and_replace_tensors(
                         module.register_forward_pre_hook(get_hook(threads_per_block, bytes_per_thread))
 
                         # Configure weight injection based on module type
+                        checkpoint_unit = checkpoint_name.rpartition('.')[0]
                         for pattern, attr_names in pattern_dict.items():
-                            if re.fullmatch(pattern, '.'.join(parts[:-1])):
+                            if re.fullmatch(pattern, checkpoint_unit) or re.fullmatch(pattern, '.'.join(parts[:-1])):
                                 if isinstance(module, nn.Embedding):
                                     # Remove weight attribute from embedding layer
                                     tmp = module.weight
@@ -304,7 +420,15 @@ def load_and_replace_tensors(
                             'shared_mem_size',
                             threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
                         )
-    
+
+    if problems:
+        shown = '\n  '.join(problems[:20])
+        more = f'\n  ... and {len(problems) - 20} more' if len(problems) > 20 else ''
+        raise ValueError(
+            f"{len(problems)} part(s) of the DFloat11 checkpoint could not be loaded into "
+            f"{type(model).__name__}; the model would run with uninitialized weights:\n  {shown}{more}"
+        )
+
     return model
 
 
@@ -323,12 +447,13 @@ def get_no_split_classes(model, pattern_dict):
         List of class names that should not be split across devices
     """
     no_split_classes = []
-    for pattern in pattern_dict:
-        for full_name, sub_module in model.named_modules():
-            if re.fullmatch(pattern, full_name):
-                class_name = sub_module.__class__.__name__
-                if class_name not in no_split_classes:
-                    no_split_classes.append(class_name)
+    for full_name, sub_module in model.named_modules():
+        # A DFloat11 unit holds its lookup tables, whatever its name in this transformers version
+        is_unit = hasattr(sub_module, 'luts') or any(re.fullmatch(pattern, full_name) for pattern in pattern_dict)
+        if is_unit:
+            class_name = sub_module.__class__.__name__
+            if class_name not in no_split_classes:
+                no_split_classes.append(class_name)
 
     return no_split_classes
 
@@ -407,11 +532,10 @@ class DFloat11Model:
             model = bfloat16_model
         else:
             from transformers import AutoModelForCausalLM, AutoConfig, GenerationConfig
-            from transformers.modeling_utils import no_init_weights
 
             # Initialize model without loading weights
             config = AutoConfig.from_pretrained(dfloat11_model_path)
-            with no_init_weights():
+            with _no_init_weights():
                 model = AutoModelForCausalLM.from_config(
                     config, torch_dtype=torch.bfloat16, **kwargs,
                 )
@@ -502,6 +626,14 @@ def compress_model(
     check_correctness: bool = True,
 ):
     os.makedirs(save_path, exist_ok=True)
+
+    module_names = [full_name for full_name, _ in model.named_modules()]
+    unmatched = [pattern for pattern in pattern_dict if not any(re.fullmatch(pattern, n) for n in module_names)]
+    if unmatched:
+        raise ValueError(
+            f"pattern(s) {unmatched} match no module of {type(model).__name__}; nothing would be "
+            f"compressed for them. (With transformers 5, MoE experts are one fused module per layer.)"
+        )
 
     block_index = 0
     save_model = True

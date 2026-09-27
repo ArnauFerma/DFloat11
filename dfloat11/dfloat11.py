@@ -100,6 +100,55 @@ class TensorManager:
         return new_tensor
 
 
+def _decode_unit(module, threads_per_block, bytes_per_thread):
+    """Decodes one DFloat11 unit into the shared BF16 buffer of its device and returns it
+    (flat); loads the unit's offloaded tensors to the GPU first."""
+    threads_per_block = tuple(threads_per_block)
+    device = module.luts.device
+
+    # Load offloaded tensors to GPU if not already there
+    if hasattr(module, 'offloaded_tensors'):
+        for tensor_name, tensor in module.offloaded_tensors.items():
+            if not (
+                hasattr(module, tensor_name) and (getattr(module, tensor_name).device == device)
+            ):
+                module.register_buffer(tensor_name, tensor.to(device, non_blocking=True))
+
+    # Get dimensions for tensor reconstruction
+    n_elements = module.sign_mantissa.numel()
+    n_bytes = module.encoded_exponent.numel()
+    n_luts = module.luts.shape[0]
+
+    # Get output tensor for reconstructed weights
+    reconstructed = TensorManager.allocate_bfloat16(device, n_elements)
+
+    # Configure CUDA grid dimensions for the kernel launch
+    blocks_per_grid = (int(math.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))), )
+
+    # Launch CUDA kernel to decode the compressed weights
+    with cp.cuda.Device(device.index):
+        _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=module.shared_mem_size, args=[
+            module.luts.data_ptr(),
+            module.encoded_exponent.data_ptr(),
+            module.sign_mantissa.data_ptr(),
+            module.output_positions.data_ptr(),
+            module.gaps.data_ptr(),
+            reconstructed.data_ptr(),
+            n_luts, n_bytes, n_elements
+        ])
+    return reconstructed
+
+
+def _drop_offloaded(module):
+    """Deletes a unit's offloaded tensors from the GPU after decoding."""
+    if hasattr(module, 'offloaded_tensors'):
+        for tensor_name in module.offloaded_tensors.keys():
+            if hasattr(module, tensor_name):
+                tmp = getattr(module, tensor_name)
+                delattr(module, tensor_name)
+                del tmp
+
+
 def get_hook(threads_per_block, bytes_per_thread):
     """
     Creates a PyTorch forward pre-hook that decodes compressed DFloat11 weights on-the-fly.
@@ -117,38 +166,7 @@ def get_hook(threads_per_block, bytes_per_thread):
     threads_per_block = tuple(threads_per_block)
 
     def decode_hook(module, _):
-        device = module.luts.device
-
-        # Load offloaded tensors to GPU if not already there
-        if hasattr(module, 'offloaded_tensors'):
-            for tensor_name, tensor in module.offloaded_tensors.items():
-                if not (
-                    hasattr(module, tensor_name) and (getattr(module, tensor_name).device == device)
-                ):
-                    module.register_buffer(tensor_name, tensor.to(device, non_blocking=True))
-
-        # Get dimensions for tensor reconstruction
-        n_elements = module.sign_mantissa.numel()
-        n_bytes = module.encoded_exponent.numel()
-        n_luts = module.luts.shape[0]
-
-        # Get output tensor for reconstructed weights
-        reconstructed = TensorManager.allocate_bfloat16(device, n_elements)
-
-        # Configure CUDA grid dimensions for the kernel launch
-        blocks_per_grid = (int(math.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))), )
-
-        # Launch CUDA kernel to decode the compressed weights
-        with cp.cuda.Device(device.index):
-            _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=module.shared_mem_size, args=[
-                module.luts.data_ptr(),
-                module.encoded_exponent.data_ptr(),
-                module.sign_mantissa.data_ptr(),
-                module.output_positions.data_ptr(),
-                module.gaps.data_ptr(),
-                reconstructed.data_ptr(),
-                n_luts, n_bytes, n_elements
-            ])
+        reconstructed = _decode_unit(module, threads_per_block, bytes_per_thread)
 
         # Inject reconstructed weights into the appropriate module
         if isinstance(module, nn.Linear):
@@ -165,13 +183,7 @@ def get_hook(threads_per_block, bytes_per_thread):
             for sub_module, weight in zip(module.weight_injection_modules, weights):
                 sub_module.weight = weight.view(sub_module.out_features, sub_module.in_features)
 
-        # Delete tensors from GPU if offloading is enabled
-        if hasattr(module, 'offloaded_tensors'):
-            for tensor_name in module.offloaded_tensors.keys():
-                if hasattr(module, tensor_name):
-                    tmp = getattr(module, tensor_name)
-                    delattr(module, tensor_name)
-                    del tmp
+        _drop_offloaded(module)
 
     return decode_hook
 
@@ -204,7 +216,10 @@ def _checkpoint_key_renamer(model):
     except ImportError:
         PreTrainedModel = None
     if PreTrainedModel is None or not isinstance(model, PreTrainedModel):
-        return lambda key: (key, False)
+        def rename(key):
+            return key, False
+        rename.rename_only, rename.converters = (lambda key: key), []
+        return rename
 
     try:  # transformers >= 5
         from transformers.conversion_mapping import get_model_conversion_mapping
@@ -218,6 +233,7 @@ def _checkpoint_key_renamer(model):
                 if n_replaced > 0:
                     return new_key, False
             return key, False
+        rename.rename_only, rename.converters = (lambda key: rename(key)[0]), []
         return rename
 
     transforms = get_model_conversion_mapping(model)
@@ -230,7 +246,142 @@ def _checkpoint_key_renamer(model):
             key, renamings, converters, model.base_model_prefix, expected_keys
         )
         return new_key, converter_pattern is not None
+
+    def rename_only(key):
+        """The key after the renamings, before any conversion."""
+        return rename_source_key(key, renamings, [], model.base_model_prefix, expected_keys)[0]
+    rename.rename_only, rename.converters = rename_only, converters
     return rename
+
+
+class DFloat11ExpertUnit(nn.Module):
+    """
+    The DFloat11 buffers of one MoE expert whose weights transformers >= 5 keeps fused in
+    its experts module (for example `gate_up_proj` and `down_proj`, one slice per expert).
+    `parts` lists, in the unit's tensor order, the `WeightConverter` that fuses each weight,
+    its source pattern, and the fused parameter it goes to.
+    """
+
+    def __init__(self, index, parts):
+        super().__init__()
+        self.index = index
+        self.parts = parts
+
+
+def _fused_expert_plan(rename, unit, attr_names):
+    """
+    For a DFloat11 unit that holds one MoE expert (`...experts.N` with its weights), finds
+    where transformers >= 5 puts its weights: (experts module path, expert index, parts).
+    Returns None if the unit's weights do not all go to fused expert parameters.
+    """
+    if not attr_names or not rename.converters:
+        return None
+    parts, experts_path, index = [], None, None
+    for attr in attr_names:
+        key = rename.rename_only(f"{unit}.{attr}.weight")
+        match = next(((c, c.rename_source_key(key)) for c in rename.converters
+                      if c.rename_source_key(key)[1] is not None), None)
+        if match is None:
+            return None
+        converter, (target_key, source_pattern) = match
+        path, param_name = target_key.rsplit('.', 1)
+        rest = key[len(path) + 1:].split('.') if key.startswith(path + '.') else []
+        if not rest or not rest[0].isdigit() or experts_path not in (None, path):
+            return None
+        experts_path, index = path, int(rest[0])
+        parts.append((converter, source_pattern, target_key, param_name))
+    return experts_path, index, parts
+
+
+def _source_shapes(module, unit, sizes):
+    """The 2D shape of each weight of an expert unit, before fusing: the shapes that the
+    unit's converters turn into one expert's slice of the fused parameters."""
+    shapes = {}
+    for converter in dict.fromkeys(c for c, _, _, _ in unit.parts):
+        items = [(sp, n) for (c, sp, _, _), n in zip(unit.parts, sizes) if c is converter]
+        param_name = next(name for c, _, _, name in unit.parts if c is converter)
+        target_shape = (1,) + tuple(module._df11_fused_shapes[param_name][1:])
+        candidates = [[(n // d, d) for d in dict.fromkeys(target_shape[1:]) if d and n % d == 0] for _, n in items]
+        found = None
+        for combo in _product(candidates):
+            tensors = {sp: [torch.empty(shape, device='meta')] for (sp, _), shape in zip(items, combo)}
+            try:
+                for op in converter.operations:
+                    tensors = op.convert(tensors, source_patterns=converter.source_patterns,
+                                         target_patterns=converter.target_patterns)
+            except Exception:
+                continue
+            out = next(iter(tensors.values()))
+            if tuple(out.shape) == target_shape:
+                found = combo
+                break
+        if found is None:
+            raise ValueError(
+                f"cannot fit the DFloat11 weights of expert {unit.index} into {param_name} {tuple(target_shape[1:])}"
+            )
+        for (sp, _), shape in zip(items, found):
+            shapes[sp] = shape
+    return shapes
+
+
+def _product(lists):
+    if not lists:
+        yield []
+        return
+    for first in lists[0]:
+        for rest in _product(lists[1:]):
+            yield [first] + rest
+
+
+class FusedExpertBuffers:
+    """Shared buffers for the fused expert parameters, one per device, parameter name and
+    shape, reused by every layer (the experts of one layer are decoded right before it
+    runs), as TensorManager does for single weights."""
+    _tensors = {}
+
+    @staticmethod
+    def get(device, name, shape):
+        key = (device, name, tuple(shape))
+        if key not in FusedExpertBuffers._tensors:
+            FusedExpertBuffers._tensors[key] = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        return FusedExpertBuffers._tensors[key]
+
+
+def get_experts_hook(threads_per_block, bytes_per_thread):
+    """
+    Creates a forward pre-hook for an experts module of transformers >= 5 whose experts are
+    stored as DFloat11 units. The router's choice arrives as the experts module's
+    `top_k_index` argument; only the selected experts are decoded, each into its slice of
+    the fused parameters, then the module's own forward (any experts implementation) runs.
+    """
+
+    def experts_hook(module, args, kwargs):
+        top_k_index = kwargs['top_k_index'] if 'top_k_index' in kwargs else args[1]
+        device = top_k_index.device
+        fused = {name: FusedExpertBuffers.get(device, name, shape)
+                 for name, shape in module._df11_fused_shapes.items()}
+        for index in torch.unique(top_k_index).tolist():
+            unit = module.df11_experts[str(index)] if str(index) in module.df11_experts else None
+            if unit is None:
+                continue  # an index the experts module itself skips (for example expert parallelism's sentinel)
+            reconstructed = _decode_unit(unit, threads_per_block, bytes_per_thread)
+            weights = torch.tensor_split(reconstructed, unit.split_positions) if hasattr(unit, 'split_positions') \
+                else [reconstructed]
+            if not hasattr(module, '_df11_source_shapes'):
+                module._df11_source_shapes = _source_shapes(module, unit, [w.numel() for w in weights])
+            for converter in dict.fromkeys(c for c, _, _, _ in unit.parts):
+                tensors = {sp: [w.view(module._df11_source_shapes[sp])]
+                           for (c, sp, _, _), w in zip(unit.parts, weights) if c is converter}
+                target_key, param_name = next((t, n) for c, _, t, n in unit.parts if c is converter)
+                for op in converter.operations:
+                    tensors = op.convert(tensors, source_patterns=converter.source_patterns,
+                                         target_patterns=converter.target_patterns, full_layer_name=target_key)
+                fused[param_name][index].copy_(next(iter(tensors.values()))[0])
+            _drop_offloaded(unit)
+        for name, tensor in fused.items():
+            setattr(module, name, tensor)
+
+    return experts_hook
 
 
 def load_and_replace_tensors(
@@ -300,7 +451,15 @@ def load_and_replace_tensors(
                 weight_key = f"{unit}.{attr_names[0]}.weight" if attr_names else f"{unit}.weight"
                 new_weight_key, needs_conversion = rename(weight_key)
                 inside = weight_key[len(unit):]  # the weight's name inside the unit
-                if needs_conversion:
+                plan = _fused_expert_plan(rename, unit, attr_names) if needs_conversion else None
+                if plan is not None:
+                    experts_path, index, parts = plan
+                    experts = model.get_submodule(experts_path)
+                    if not hasattr(experts, 'df11_experts'):
+                        experts.df11_experts = nn.ModuleDict()
+                    experts.df11_experts[str(index)] = DFloat11ExpertUnit(index, parts)
+                    new_unit, needs_conversion = f"{experts_path}.df11_experts.{index}", False
+                elif needs_conversion:
                     new_unit = None
                     problems.append(
                         f"{unit} (DFloat11 unit): transformers {transformers_version} converts this module's "
@@ -381,7 +540,9 @@ def load_and_replace_tensors(
                             module.register_buffer(parts[-1], tensor_value)
 
                     # Set up decompression for encoded weights
-                    if parts[-1] == 'encoded_exponent':
+                    if parts[-1] == 'encoded_exponent' and isinstance(module, DFloat11ExpertUnit):
+                        pass  # decoded by its experts module's hook
+                    elif parts[-1] == 'encoded_exponent':
                         # Register the decode hook to decompress weights during forward pass
                         module.register_forward_pre_hook(get_hook(threads_per_block, bytes_per_thread))
 
@@ -421,6 +582,23 @@ def load_and_replace_tensors(
                             threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
                         )
 
+    for experts_path, experts in model.named_modules():
+        if not hasattr(experts, 'df11_experts') or hasattr(experts, '_df11_fused_shapes'):
+            continue
+        experts._df11_fused_shapes = {}
+        for unit in experts.df11_experts.values():
+            for _, _, _, param_name in unit.parts:
+                if param_name not in experts._df11_fused_shapes:
+                    param = getattr(experts, param_name)
+                    experts._df11_fused_shapes[param_name] = tuple(param.shape)
+                    delattr(experts, param_name)
+                    del param
+        missing = sorted(set(range(experts._df11_fused_shapes[next(iter(experts._df11_fused_shapes))][0]))
+                         - {unit.index for unit in experts.df11_experts.values()})
+        if missing:
+            problems.append(f"{experts_path}: experts {missing} are not in the DFloat11 checkpoint")
+        experts.register_forward_pre_hook(get_experts_hook(threads_per_block, bytes_per_thread), with_kwargs=True)
+
     if problems:
         shown = '\n  '.join(problems[:20])
         more = f'\n  ... and {len(problems) - 20} more' if len(problems) > 20 else ''
@@ -449,7 +627,8 @@ def get_no_split_classes(model, pattern_dict):
     no_split_classes = []
     for full_name, sub_module in model.named_modules():
         # A DFloat11 unit holds its lookup tables, whatever its name in this transformers version
-        is_unit = hasattr(sub_module, 'luts') or any(re.fullmatch(pattern, full_name) for pattern in pattern_dict)
+        is_unit = hasattr(sub_module, 'luts') or hasattr(sub_module, 'df11_experts') \
+            or any(re.fullmatch(pattern, full_name) for pattern in pattern_dict)
         if is_unit:
             class_name = sub_module.__class__.__name__
             if class_name not in no_split_classes:

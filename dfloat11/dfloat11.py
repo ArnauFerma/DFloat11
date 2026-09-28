@@ -563,6 +563,12 @@ def load_and_replace_tensors(
                             if (cpu_offload_blocks is not None) and (cpu_offload_blocks > 0) and (len(module.offloaded_tensors) == len(offloaded_tensor_names)):
                                 cpu_offload_blocks -= 1
                         else:
+                            if parts[-1] == 'gaps':
+                                # decode.cu reads gaps[thread_id * 5 / 8 + 1], one byte past the array
+                                # for the last threads; if the buffer ends where its memory segment
+                                # ends, that read can fault (illegal memory access). Zeros after it
+                                # keep the read inside; the byte read never changes a decoded value.
+                                tensor_value = torch.cat([tensor_value, tensor_value.new_zeros(8)])
                             # Register the buffer to the found module
                             module.register_buffer(parts[-1], tensor_value)
 
@@ -905,6 +911,8 @@ def compress_model(
                     n_bytes = encoded.numel()
 
                     cuda_luts, cuda_encoded, cuda_other_8bits, cuda_output_positions, cuda_gaps = list(map(lambda x: x.to(device), [luts, encoded, other_8bits, output_positions, gaps]))
+                    # zeros after gaps, as the loader adds: decode.cu reads one byte past it
+                    cuda_gaps = torch.cat([cuda_gaps, cuda_gaps.new_zeros(8)])
                     cuda_outputs = torch.empty(n_elements, dtype=torch.bfloat16, device=device)
 
                     blocks_per_grid = (int(np.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))), )
